@@ -1,0 +1,507 @@
+---
+title: "Analysis of arrays for the knockdown of various export compoenets"
+output: html_notebook
+---
+
+Arrays are single colour agilent arrays, and are stored on DropBox. First it is neccessary to lad in the data and do background correction.We want to remove samples with LUZP4 and SSRP72.
+
+```{r,results='hide'}
+library(limma)
+path = "/mnt/winhome/Dropbox/Microarray data collated/Gene Expression Lists/1- Raw data files/"
+targets <- readTargets(path=path, row.names="SlideName")
+targets <- subset(targets, !(knockdown %in% c("FLAG_LUZP4", "SSRP1", "FLP_IN_293")))
+raw_slides = read.maimages(targets$FileName, source="agilent", path=path, green.only=TRUE, names = targets$SlideName)
+bc_data <- backgroundCorrect(raw_slides, method="normexp", offset=10)
+```
+
+# Background correction #
+
+Lets take a look at the background
+```{r}
+library(ggplot2)
+library(reshape2)
+ggplot(melt(data.frame(raw_slides$Eb), variable.name = "Array", value.name="background")) + 
+  aes(x=Array, y=background) + 
+  geom_boxplot(outlier.shape = NA) + 
+  scale_y_log10() +
+  theme_bw(base_size = 9) + 
+  coord_cartesian(ylim = c(10,100)) + 
+  theme(axis.text.x=element_text(angle=-90, hjust = 0))
+```
+and the forground:
+```{r}
+library(ggplot2)
+library(reshape2)
+ggplot(melt(data.frame(raw_slides$E), variable.name = "Array", value.name="foreground")) + 
+  aes(x=Array, y=foreground) + 
+  geom_boxplot(outlier.shape = NA) + 
+  scale_y_log10() +
+  theme_bw(base_size = 9) + 
+  coord_cartesian(ylim = c(10,10000)) + 
+  theme(axis.text.x=element_text(angle=-90, hjust = 0))
+```
+
+There is clear variation in the levels of background, but the variation in the foreground is much lower. Does this mean we will be introducing extra variation by doing background correction? Lets look at the control spots:
+
+```{r, fig.width=8}
+library(dplyr)
+data.frame(raw_slides$E, ControlType = raw_slides$genes$ControlType, ProbeName = raw_slides$genes$ProbeName) %>%
+  subset(ControlType != 0) %>%
+  melt(id.vars=c("ControlType","ProbeName"),
+       variable.name = "Array",
+       value.name = "Intensity") %>%
+  ggplot(aes(Array, Intensity, fill=as.factor(ControlType))) +
+  geom_boxplot(outlier.shape = NA, position="dodge", lwd=0.5) +
+  coord_cartesian(ylim=c(10,1000)) +
+  theme_bw(base_size=9) +
+  scale_y_log10() +
+  guides(color=FALSE, shape=FALSE, fill=FALSE) + 
+  theme(axis.text.x=element_text(angle=-90, hjust = 0, vjust=0.5))
+```
+
+The control spots look remarkabley like the background. The materials and methods lists that spike-ins were used, but I'm a bit worried here.Lets look at the spike-in data. The spikeins are in a set of probes named (+)E1A..... and have concentrations defined in the agilent manual Still there is clear variable, so perhaps it does make make sense to just the background corrected values. Lets take a look at those:
+
+```{r}
+spikeins = data.frame(probe = c("(+)E1A_r60_3", "(+)E1A_r60_a97", "(+)E1A_r60_a20",  "(+)E1A_r60_a135", "(+)E1A_r60_a22", "(+)E1A_r60_a104", "(+)E1A_r60_a107",
+                                "(+)E1A_r60_1", "(+)E1A_r60_n9", "(+)E1A_r60_n11"),
+                     conc  = c(0.3, 4.82, 3.83, 3.3, 4.3, 1.3, 2.3, 6.3, 5.82, 5.3))
+row.names(spikeins) <- spikeins$probe
+print(spikeins)
+```
+```{r,fig.height=6, fig.width=8}
+spikein_data = raw_slides[raw_slides$genes$ProbeName %in% spikeins$probe,]
+data.frame(spikein_data$E, conc=spikeins[spikein_data$genes$ProbeName,"conc"]) %>% 
+  melt(id.vars="conc", variable.name="SlideName", value.name="E") %>%
+  merge(targets) %>%
+  ggplot(aes(x=conc, y=E, col=fraction, group=paste(fraction,replicate))) +
+  geom_smooth(lwd=0.5, alpha=0.5) +
+  facet_wrap(~knockdown) +
+  theme_bw(base_size = 9) +
+  scale_y_log10()
+
+```
+What do we note from this? Well, on the slides where the background is high, there is still a good relationship between concentration of the spike in and signal. Second that we only have a linear response after about 30-100 depending on the slide, BUT its not the slides with the high background that have the poorer linear response. In addition, in some samples there is a hint that the cytoplasmic samples have a higher intensity for the same amount of RNA. This suggests that the gain has been turned up, perhaps to compensate for there being less RNA?  What does norm_exp background correction do to things? 
+
+## NormExp background correction ##
+
+```{r}
+library(ggplot2)
+library(reshape2)
+ggplot(melt(data.frame(bc_data$E), variable.name = "Array", value.name="intensity")) + 
+  aes(x=Array, y=intensity) + 
+  geom_boxplot(outlier.shape = NA) + 
+  scale_y_log10() +
+  theme_bw(base_size = 9) + 
+  theme(axis.text.x=element_text(angle=-90, hjust = 0, vjust=0.5))
+```
+Okay, so that definately looks worst in some cases that the uncorrected, but that doesn't seem to correlate with the ones that had different background, or rather the outliers do look like that are ones that had high background, but not all those with high background are outliers. Lets have a look at the control spots again:
+```{r}
+data.frame(bc_data$E, ControlType = bc_data$genes$ControlType, ProbeName = bc_data$genes$ProbeName) %>%
+  subset(ControlType != 0) %>%
+  melt(id.vars=c("ControlType","ProbeName"),
+       variable.name = "Array",
+       value.name = "Intensity") %>%
+  ggplot(aes(Array, Intensity, fill=as.factor(ControlType))) +
+  geom_boxplot(outlier.shape = NA, position="dodge", lwd=0.5) +
+  coord_cartesian(ylim=c(10,1000)) +
+  theme_bw(base_size=9) +
+  scale_y_log10() +
+  guides(color=FALSE, shape=FALSE, fill=FALSE) + 
+  theme(axis.text.x=element_text(angle=-90, hjust = 0, vjust=0.5))
+```
+Okay, so that outlier arrays look off in this as well.... well off. What do the spikeins look like? 
+```{r, fig.height=6, fig.width=8}
+bc_spikein_data = bc_data[bc_data$genes$ProbeName %in% spikeins$probe,]
+data.frame(bc_spikein_data$E, conc=spikeins[bc_spikein_data$genes$ProbeName,"conc"]) %>% 
+  melt(id.vars="conc", variable.name="SlideName", value.name="E") %>%
+  merge(targets) %>%
+  ggplot(aes(x=conc, y=E, col=fraction, group=paste(fraction,replicate))) +
+  geom_smooth(lwd=0.5, alpha=0.5) +
+  facet_wrap(~knockdown) +
+  theme_bw(base_size = 9) +
+  scale_y_log10()
+```
+## Minimum background correction ##
+
+So this is clearly no good. In the arrays with the funny correction now have no linear response until 1000. Is "minimum" correction any better:
+```{r}
+bc_data = backgroundCorrect(raw_slides, method="minimum")
+bc_spikein_data = bc_data[bc_data$genes$ProbeName %in% spikeins$probe,]
+data.frame(bc_spikein_data$E, conc=spikeins[bc_spikein_data$genes$ProbeName,"conc"]) %>% 
+  melt(id.vars="conc", variable.name="SlideName", value.name="E") %>%
+  merge(targets) %>%
+  ggplot(aes(x=conc, y=E, col=fraction, group=paste(fraction,replicate))) +
+  geom_smooth(lwd=0.5, alpha=0.5) +
+  facet_wrap(~knockdown) +
+  theme_bw(base_size = 9) +
+  scale_y_log10()
+
+```
+
+Thats much better (if not much different from the uncorrected). But we still have poor responsiveness in the low end from arrays with high background (i.e. the correction hasn't done much). Alternatively we could remove the bad arrays, as the the normexp does do a better job of correcting for higher background in all but these cases. The trouble with this is that one of them is a control, and the loss of power by losing one of the controls is not good.
+
+What do the boxes look like now?
+```{r}
+ggplot(melt(data.frame(bc_data$E), variable.name = "Array", value.name="foreground")) + 
+  aes(x=Array, y=foreground) + 
+  geom_boxplot(outlier.shape = NA) + 
+  scale_y_log10() +
+  theme_bw(base_size = 9) + 
+#  coord_cartesian(ylim = c(10,100000)) + 
+  theme(axis.text.x=element_text(angle=-90, hjust = 0))
+```
+Interesting. Although the standout samples here are the UAP56-DDX39 knockdowns, although their spikeins look fine. This should be considered a good thing I suppose. 
+
+What about the distribution of the negative controls?
+
+```{r}
+ggplot(melt(data.frame(bc_data$E[bc_data$genes$ControlType==-1,]), variable.name = "Array", value.name="foreground")) + 
+  aes(x=Array, y=foreground) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_hline(yintercept = 15) +
+  scale_y_log10() +
+  theme_bw(base_size = 9) + 
+#  coord_cartesian(ylim = c(10,100000)) + 
+  theme(axis.text.x=element_text(angle=-90, hjust = 0))
+```
+
+SO some of the arrays have higher intensity in the negative controls, which suggeststhat the normalization hasn't succeeded. 
+Do they clust with the others? Lets say the outliers are those with controlspot averages above 100:
+
+```{r}
+subset(bc_data$E, bc_data$genes$ControlType == -1) %>% log() %>% colMeans() %>% exp() -> neg_means
+hist(neg_means, breaks=30)
+```
+Seems there are two natureal break poitns in the negatative control distribution: around 12 and around 20.
+
+```{r, fig.height=8, fig.width=8}
+outliers = neg_means > 20
+row.colours = rep("white", times = length(colnames(bc_data)))
+row.colours[outliers] <- "blue"
+library(gplots)
+cormat <- cor(log2(bc_data$E))
+distmat = as.dist(1-cormat)
+clust = hclust(distmat)
+dend = as.dendrogram(clust)
+heatmap.2(cormat, trace="none", Rowv = dend, Colv = dend, margins = c(10,10), cexRow=0.6, cexCol=0.6, lhei=c(1,6), lwid=c(1,6), RowSideColors = row.colours)
+```
+So the two clusters are pretty well correlated with negative controls having a geometric mean intensity of greater than 20, this almost certainly suggests that the background subtraction is failing. One thing we have not tried is normexp using the negative controls. Lets try that.
+
+## Negative Control based NormExp backgruond correction ##
+
+```{r, fig.height=6, fig.width=8}
+raw_slides$genes$Status <- ifelse(raw_slides$genes$ControlType == -1, "negative", "regular")
+bc_data <- nec(raw_slides)
+bc_spikein_data = bc_data[bc_data$genes$ProbeName %in% spikeins$probe,]
+data.frame(bc_spikein_data$E, conc=spikeins[bc_spikein_data$genes$ProbeName,"conc"]) %>% 
+  melt(id.vars="conc", variable.name="SlideName", value.name="E") %>%
+  merge(targets) %>%
+  ggplot(aes(x=conc, y=E, col=fraction, group=paste(fraction,replicate))) +
+  geom_smooth(lwd=0.5, alpha=0.5) +
+  facet_wrap(~knockdown) +
+  theme_bw(base_size = 9) +
+  scale_y_log10() +
+  ggtitle("SpikeIn distribution after NEC backgruond correction")
+```
+Not perfect, we still have outlier arrays - one of the SPT16 cytoplasmic samples and one of the THOC-ALYREF total samples. Are these also outliers in the boxplots:
+
+```{r}
+ggplot(melt(data.frame(bc_data$E), variable.name = "Array", value.name="foreground")) + 
+  aes(x=Array, y=foreground) + 
+  geom_boxplot(outlier.shape = NA) + 
+  scale_y_log10() +
+  theme_bw(base_size = 9) + 
+  coord_cartesian(ylim = c(10,100000)) + 
+  theme(axis.text.x=element_text(angle=-90, hjust = 0)) +
+  ggtitle("Probe Intensity distributions after NEC background correction")
+```
+So those arrays definately do stand out, not by their mean, but by a truncated low intensity. And the negative control probes:
+
+```{r}
+ggplot(melt(data.frame(bc_data$E[bc_data$genes$ControlType==-1,]), variable.name = "Array", value.name="foreground")) + 
+  aes(x=Array, y=foreground) + 
+  geom_boxplot() + 
+#  geom_hline(yintercept = 15) +
+  scale_y_log10() +
+  theme_bw(base_size = 9) + 
+#  coord_cartesian(ylim = c(10,150)) + 
+  theme(axis.text.x=element_text(angle=-90, hjust = 0))
+```
+Ah ha! The SPT16 array has a big fat outlier on it. NEC includes a robust mode. Lets have a look at that:
+
+## Robust Negative control based NormExp ##
+
+```{r, fig.height=6, fig.width=8}
+raw_slides$genes$Status <- ifelse(raw_slides$genes$ControlType == -1, "negative", "regular")
+bc_data <- nec(raw_slides, robust = T)
+bc_spikein_data = bc_data[bc_data$genes$ProbeName %in% spikeins$probe,]
+data.frame(bc_spikein_data$E, conc=spikeins[bc_spikein_data$genes$ProbeName,"conc"]) %>% 
+  melt(id.vars="conc", variable.name="SlideName", value.name="E") %>%
+  merge(targets) %>%
+  ggplot(aes(x=conc, y=E, col=fraction, group=paste(fraction,replicate))) +
+  geom_smooth(lwd=0.5, alpha=0.5) +
+  facet_wrap(~knockdown) +
+  theme_bw(base_size = 9) +
+  scale_y_log10() +
+  ggtitle("SpikeIn distribution after NEC backgruond correction")
+```
+
+```{r}
+ggplot(melt(data.frame(bc_data$E), variable.name = "Array", value.name="foreground")) + 
+  aes(x=Array, y=foreground) + 
+  geom_boxplot(outlier.shape = NA) + 
+  scale_y_log10() +
+  theme_bw(base_size = 9) + 
+  coord_cartesian(ylim = c(10,100000)) + 
+  theme(axis.text.x=element_text(angle=-90, hjust = 0)) +
+  ggtitle("Probe Intensity distributions after robust NEC background correction")
+```
+```{r}
+ggplot(melt(data.frame(bc_data$E[bc_data$genes$ControlType==-1,]), variable.name = "Array", value.name="foreground")) + 
+  aes(x=Array, y=foreground) + 
+  geom_boxplot() + 
+#  geom_hline(yintercept = 15) +
+  scale_y_log10() +
+  theme_bw(base_size = 9) + 
+  coord_cartesian(ylim = c(10,75)) + 
+  theme(axis.text.x=element_text(angle=-90, hjust = 0))+
+  ggtitle("Negative control probe intensity after robust NEC background correction")
+```
+
+Much better. There are still a couple of weird slides - C.UIF.96.2 and T.THOC5-ALYREF.1 amounst them, but much better than it was. How is the clustering looking?
+
+```{r, fig.height=8, fig.width=8}
+
+outliers = neg_means > 20
+row.colours = rep("white", times = length(colnames(bc_data)))
+row.colours[outliers] <- "blue"
+library(gplots)
+cormat <- cor(log2(bc_data$E))
+distmat = as.dist(1-cormat)
+clust = hclust(distmat)
+dend = as.dendrogram(clust)
+heatmap.2(cormat, trace="none", Rowv = dend, Colv = dend, margins = c(10,10), cexRow=0.6, cexCol=0.6, lhei=c(1,6), lwid=c(1,6), RowSideColors = row.colours)
+```
+
+Still some weirdness in the clustering, with the samples that had weird backgrounds before still be more common in one cluster than others.
+
+Indeed, these arrays cluster together an away from the otheres. They may well be trouble and we might have to remove them at some point, although lets go through with the analysis and then think about removing them. 
+
+## Non-expressed probes ##
+
+There is a large non-linear sectinon to many of the response curves in the spike ins. We should probably think about removing these probes, particularly for the clustering. To do this we will use the "10% brighter than the negatives" rule. Let define a per slide cutoff
+
+```{r}
+neg95 <- apply(bc_data$E[bc_data$genes$ControlType == -1,], 2, function(x) quantile(x,p=0.95))
+data.frame(bc_spikein_data$E, conc=spikeins[bc_spikein_data$genes$ProbeName,"conc"]) %>% 
+  melt(id.vars="conc", variable.name="SlideName", value.name="E") %>%
+  merge(targets) %>%
+  ggplot(aes(x=conc, y=E, col=fraction, group=paste(fraction,replicate))) +
+  geom_smooth(lwd=0.5, alpha=0.5) +
+  facet_wrap(~knockdown) +
+  theme_bw(base_size = 9) +
+  scale_y_log10() +
+  geom_hline(yintercept = mean(neg95)*1.1, lty=2, alpha=0.5) +
+  ggtitle("Negative expression cutoff vs spikeins")
+```
+
+That looks like it might be okay. 
+
+We are going to do the normalisation using an external program called "IRON", as this is supposed to cope well with experiments where a large number of the probes have changes. Before we export the data to run this with, we remove the control spots and genes that are not expressed. 
+
+```{r}
+neg95 <- apply(bc_data$E[bc_data$genes$ControlType == -1,], 2, function(x) quantile(x,p=0.95))
+cutoff = matrix(1.2*neg95, nrow(bc_data), ncol(bc_data), byrow=TRUE)
+isexpr <- rowSums(bc_data$E > cutoff) >=3
+print(table(isexpr))
+filtered_data <- bc_data[isexpr,]
+print (paste("Spots before control removal", dim(bc_data$E)[1]))
+print (paste("Spots after control removal", dim(filtered_data$E)[1]))
+```
+Now we export the expression matrix, identify the median sample, and run iron_generic to normalise, and then reload
+
+```{r}
+fn <-  paste(path, "background_corrected.txt", sep="")
+median_file = paste(path, "findmedian.txt", sep="")
+median_log = paste(path, "findmedian.log", sep="/")
+normed_out = paste(path, "normed_out.txt", sep="")
+norm_log_file = paste(path, "norm.log", sep="/")
+print(fn)
+fnq = shQuote(fn)
+print(fnq)
+write.table(filtered_data$E, file = fn, quote = F, sep = "\t", col.names= NA, row.names = T)
+system2(command = "/home/mb1ims/bin/bio/libaffy/bin/findmedian", 
+        args = c("--spreadsheet ", fnq), 
+        stdout = median_file,
+        stderr = median_log,)
+median_sample <- system(command = paste("cat", shQuote(median_file),
+                                       "| grep '^Median CEL:'",
+                                        "| cut -f 4", sep=" "),
+                        intern=TRUE)
+print(median_sample)
+
+system2(command = "/home/mb1ims/bin/bio/libaffy/bin/iron_generic",
+        args = c("--bg-none",
+                 paste("--norm-iron", median_sample, sep="="),
+                 paste("-o", shQuote(normed_out)),
+                 fnq),
+        stdout = norm_log_file,
+        stderr = norm_log_file)
+
+normed_exp <- read.delim(normed_out, header=T, row.names=1)
+normed_data <- filtered_data
+normed_data$E <- normed_exp
+normed_data <- new("EList", unclass(normed_data))
+
+```
+
+Okay, lets have a look at the boxplots:
+
+```{r}
+ggplot(melt(data.frame(normed_data$E), variable.name = "Array", value.name="intensity")) + 
+  aes(x=Array, y=intensity) + 
+  geom_boxplot(outlier.shape = NA) + 
+  theme_bw(base_size = 9) + 
+  theme(axis.text.x=element_text(angle=-90, hjust = 0, vjust=0.5))
+```
+
+Lets look at the controls:
+
+```{r}
+normed_spikein_data = normed_data[normed_data$genes$ProbeName %in% spikeins$probe,]
+data.frame(normed_spikein_data$E, conc=spikeins[normed_spikein_data$genes$ProbeName,"conc"]) %>% 
+  melt(id.vars="conc", variable.name="SlideName", value.name="E") %>%
+  merge(targets) %>%
+  ggplot(aes(x=conc, y=E, col=fraction, group=paste(fraction,replicate))) +
+  geom_smooth(lwd=0.5, alpha=0.5) +
+  facet_wrap(~knockdown) +
+  theme_bw(base_size = 9) +
+  scale_y_log10() +
+  ggtitle("Post-normalisation spike in curves")
+```
+
+
+This is clearly wrong. We don't expect to see Cytoplsmic samples matching total samples in the spike ins because concentrations were normalised before adding the spike-ins. But that the cytoplasmic samples are HIGHER, rings alarm bells. 
+
+
+So this is definately more homogenious that it was before. Lets hope that we havn't lost important information
+Lets look what the clustering looks like
+
+```{r, fig.width=8, fig.height=8}
+
+row.colours = rep("white", times = length(colnames(bc_data)))
+row.colours[outliers] <- "blue"
+library(gplots)
+cormat <- cor(normed_data$E)
+distmat = as.dist(1-cormat)
+clust = hclust(distmat)
+dend = as.dendrogram(clust)
+heatmap.2(cormat, trace="none", Rowv = dend, Colv = dend, margins = c(10,10), cexRow=0.6, cexCol=0.6, lhei=c(1,6), lwid=c(1,6), RowSideColors = row.colours)
+```
+So, looking at this we see: For the most part, the Total and cytoplasmic sample now cluster into two groups. The exception to this is the UAP56_DDX39 samples, that cluster off on thier own. With each main cluster the replicates generally, but not 100% cluster together. Unfortunately the three control samples do not cluster together. The samples that were outliers before are now fully intergrated with the rest of the samples, and for the most part with their cognate replicates. On balance, I think we should probably leave those in here for now. 
+
+Now to create the design matrix. We only want to deal with the single knockdowns to start with. All of the knockdowns are:
+
+```{r}
+neg95 <- apply(normed_data$E[normed_data$genes$ControlType == -1,], 2, function(x) quantile(x,p=0.95))
+cutoff = matrix(1.1*neg95, nrow(normed_data), ncol(normed_data), byrow=TRUE)
+isexpr <- rowSums(normed_data$E > cutoff) >=3
+print(table(isexpr))
+filtered_normed_data <- normed_data[normed_data$genes$ControlType == 0 & isexpr,]
+print (paste("Spots before control removal", dim(normed_data$E)[1]))
+print (paste("Spots after control removal", dim(filtered_normed_data$E)[1]))
+```
+
+```{r}
+unique(targets$knockdown)
+```
+
+So we want ALYREF, CHTOP, CIRP, CONTROL, DDX39, SPT16, SSRP1, THOC5, UAP56, UIF, LUZP4:
+
+```{r}
+targets$fraction <- factor(targets$fraction)
+targets$fraction <- relevel(targets$fraction, ref = "TOTAL")
+targets$knockdown <- factor(targets$knockdown)
+targets$knockdown <- relevel(targets$knockdown, ref = "CONTROL")
+single_knockdown = c("ALYREF", "CHTOP", "CIRP_37", "CONTROL", "DDX39", "SPT16", "SSRP1", "THOC5", "UAP56", "UIF", "FLAG_LUZP4")
+single_targets <- subset(targets, knockdown %in% single_knockdown, drop=T)
+single_targets <- droplevels(single_targets)
+single_design <- model.matrix(~fraction*knockdown, data=single_targets)
+single_data = normed_data[,rownames(single_targets)]
+```
+
+Okay, we are ready to fit the model:
+
+```{r}
+ave_single_data = avereps(single_data, ID=single_data$genes$SystematicName)
+single_fit <- lmFit(single_data, single_design)
+```
+
+So lets start looking at this by making a heat map of the fold chages for genes that have significance in the F test for all interactions:
+
+```{r}
+colnames(single_design)
+single_fit <- contrasts.fit(single_fit, coefficients = c(11:18))
+single_fit <- eBayes(single_fit, trend = T)
+heatmatrix = single_fit$coefficients[p.adjust(single_fit$F.p.value, method="BH") < 0.001,]
+ccormat <- cor(heatmatrix)
+cdistmat = as.dist(1-ccormat)
+cclust = hclust(cdistmat)
+cdend <- as.dendrogram(cclust)
+rcormat <- cor(t(heatmatrix))
+rdistmat = as.dist(1-rcormat)
+rclust <- hclust(rdistmat)
+rdend <- as.dendrogram(rclust)
+heatmatrix_cropped <- heatmatrix
+heatmatrix_cropped[heatmatrix_cropped < -2.5] <- -2.5
+heatmatrix_cropped[heatmatrix_cropped > 2.5] <- 2.5
+heatmap.2(heatmatrix_cropped, 
+          trace = "none", 
+          col = colorRampPalette(c("red", "white", "blue")), 
+          Rowv = rdend)
+```
+
+That doesn't look very informative, lets look at the genes that are changed in at least one sample:
+
+```{r, fig.height=6, fig.width=4}
+tests <- decideTests(single_fit, lfc=1)
+changed_genes = rowSums(tests !=0 ) > 0
+print (table(changed_genes))
+heatmat <- single_fit$coefficients[changed_genes,]
+ccormat <- cor(heatmat)
+cdistmat = as.dist(1-ccormat)
+cclust = hclust(cdistmat)
+cdend <- as.dendrogram(cclust)
+rcormat <- cor(t(heatmat))
+rdistmat = as.dist(1-rcormat)
+rclust <- hclust(rdistmat)
+rdend <- as.dendrogram(rclust)
+heatmap.2(heatmat, 
+          trace = "none", 
+          col = colorRampPalette(c("red", "white", "blue")),
+          Colv= cdend,
+          Rowv= rdend,
+          dendrogram = "column",
+          labRow = NA)
+```
+
+Lets just check that we have all of our directions correct. 
+
+```{r}
+most_down <- which.min(single_fit$coefficients[tests[,1] == -1,1])
+print(normed_data$E[tests[,1] == -1,][most_down,targets$knockdown %in% c("ALYREF", "CONTROL")])
+```
+
+Yep, that looks right, things are down in the cytoplasm in knockdown compared to control, but up in Total compared to control. 
+
+We can plot a heatmap of test results
+
+```{r, fig.height=6, fig.width=4}
+heatmap.2(tests[changed_genes,],
+          trace="none",
+          col=colorRampPalette(c("red","white","blue")),
+          dendrogram = "column",
+          
+          labRow = NA)
+```
+
