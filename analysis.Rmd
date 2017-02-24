@@ -376,14 +376,229 @@ data.frame(normed_spikein_data$E, conc=spikeins[normed_spikein_data$genes$ProbeN
   geom_smooth(lwd=0.5, alpha=0.5) +
   facet_wrap(~knockdown) +
   theme_bw(base_size = 9) +
-  scale_y_log10() +
   ggtitle("Post-normalisation spike in curves")
 ```
 
 
 This is clearly wrong. We don't expect to see Cytoplsmic samples matching total samples in the spike ins because concentrations were normalised before adding the spike-ins. But that the cytoplasmic samples are HIGHER, rings alarm bells. 
 
+There are sevearl possibilities for where to go now. The real decsision to be made is whether we should use the spike-ins to do the normalisation, or just use then to check the results. In theory, if the spike-ins were added after concentration normalisation, then they do not serve as good standards. On the other hand, if most of the RNA is ribosomal RNA, which is not dependent on the usual export mechanisms, then this will not be such and issue. So things to consider are:
 
+1. VSN normalisation using the spike-ins
+2. Global Rank-invariant set normalisation (as opposed to IRON, which is iterative rank-invarient normalisation)
+3. Quantile normalisation (either using the whole spectrum or just the spikeins)
+
+GRSN recommends using a normalisation method before application, but it takes about RMA, which is more of a background subtraction than a normalisation. We could do VSN, which claims to deal with backgruond, but GRSN might undo the work, so perhaps we should do VSN after GRSN - get the distribution right and then shift it using the spikes. We could also effectively do what GRSN is doing, but pre-selecting the spikins as the invariant set. Lets try GRSN on its own to start with (well after NormExp) and see what happens there.
+
+First we need to define the functions. Lets start with code to select the invariant set:
+
+```{r}
+# Function to get an invarient set of probes. Will return a vector of indexes
+getInvariant <- function(eset,         # Main data as a limma eset
+                         count=5000,   # Number of invariant probes to select
+                         exclude=NA)   # Boolean expressing which probes to exlude from selection
+{
+  
+  # Data to normalize.
+  rawData <- eset$E
+  adjust <- max(0, (0.25 - min(rawData)))
+  M1 <- log2(rawData + adjust)
+  
+  total <- dim(M1)[[1]]
+  idx <- 1:total
+  subSet <- 1:total
+  
+  # exclude negative controls, spike-ins etc
+  if (!is.na(exclude))
+  {
+    total <- total - sum(exclude)
+    idx <- idx[!exclude]
+    subSet <- subSet[!exclude]
+  }
+  
+  # Calculate number of probe sets to exclude at each iteration.
+  discardNumber <- (total - count) / 4
+
+  ### Main iteration loop to get approximate GRiS. ###
+  while (TRUE)
+  {
+    total <- floor(max(total - discardNumber, count))
+    M2 <- cbind(apply(M1[idx, ], 2, rank))
+    V2 <- apply(M2, 1, var)
+    subSet <- order(V2, decreasing=FALSE)[1:total]     
+    idx <- idx[subSet]
+    if (total == count) break
+  }
+  invariantIdx <- idx
+  
+  return (invariantIdx)
+}
+
+#
+# Function to normalize arrays to a set of standards
+# Standards you be selected via the about global invarient selection.
+# or could be known controls. 
+#
+normalizeToInvarients <- function(data,            # limma eset
+                                  invariantIdx,    # index of probes to use as invariants
+                                  f)               # smoothness paramenter for loess
+{
+  rawData <- data$E
+  adjust <- max(0, (0.25 - min(rawData)))
+  M1 <- log2(rawData + adjust)
+  
+  # Get the average of the reference set.
+  # Do a trimmed mean to be robust, but eliminate the "artifact" that 
+  # shows up when doing median on an odd number of samples.
+  Mavg <- apply(M1[, ], 1, mean, trim=0.25)
+  
+  Mnew <- NULL
+  x <- Mavg
+  for (b in 1:dim(M1)[[2]])
+  {
+    y <- M1[,b]
+
+    ### M vs. A transformed data.  ###
+    M <- y-x
+    A <- (y+x)/2
+
+    ### Lowess curve based on M vs. A transformed data. ###
+    curve <- lowess(x=A[invariantIdx], y=M[invariantIdx], f=f)
+
+    ### Create evenly space lookup from calibration curve. ###
+    aCurve <- curve[[1]]
+    mCurve <- curve[[2]]
+    steps <- 1000
+    sampleMin <- min(A)
+    sampleMax <- max(A)
+    step <- (sampleMax - sampleMin) / steps
+    position <- seq(sampleMin, sampleMax, length=steps + 1)
+    adjust <- array(0,c(steps+1))
+    count <- length(aCurve)
+
+    idxL <- 1
+    idxR <- 2
+    for (i in 1:(steps + 1))
+    {
+      while (idxR < count && position[i] > aCurve[idxR])
+      {
+        idxR <- idxR + 1
+      }
+      while ((idxL + 1) < idxR && position[i] > aCurve[idxL + 1])
+      {
+        idxL <- idxL + 1
+      }
+      while (idxR < count && aCurve[idxL] >= aCurve[idxR])
+      {
+        idxR <- idxR + 1
+      }
+      if (aCurve[idxL] < aCurve[idxR])
+      {
+        adjust[i] <- (((mCurve[idxR] - mCurve[idxL])/(aCurve[idxR] - aCurve[idxL]))
+                       *(position[i] - aCurve[idxL]) + mCurve[idxL])
+      }
+    }
+
+    ### Apply lookup to data.  Can be applied to transformed or untransformed data. ###
+    yPrime <- y - adjust[(A - sampleMin) / step + 1.5]
+    mPrime <- yPrime - x
+
+    Mnew <- cbind(Mnew, yPrime)
+  }
+  
+  colnames(Mnew) <- colnames(data$E)
+  data$E <- Mnew
+  data <- new("EList", unclass(data))
+  return(data)
+}
+```
+
+Okay, so this should probably be applied to the background corrected data. Lets try doing the invarient selection:
+
+```{r}
+invariants <- getInvariant(filtered_data, count=1000, exclude = filtered_data$genes$ControlType != 0)
+GRSN_norm_data <- normalizeToInvarients(filtered_data, invariants, 0.25)
+```
+
+
+```{r}
+GRSN_normed_spikein_data = GRSN_norm_data[GRSN_norm_data$genes$ProbeName %in% spikeins$probe,]
+data.frame(GRSN_normed_spikein_data$E, conc=spikeins[GRSN_normed_spikein_data$genes$ProbeName,"conc"]) %>% 
+  melt(id.vars="conc", variable.name="SlideName", value.name="E") %>%
+  merge(targets) %>%
+  ggplot(aes(x=conc, y=E, col=fraction, group=paste(fraction,replicate))) +
+  geom_smooth(lwd=0.5, alpha=0.5) +
+  facet_wrap(~knockdown) +
+  theme_bw(base_size = 9) +
+  ggtitle("Post-normalisation spike in curves")
+```
+
+So this looks no different from using IRON. (Much quicker though). Is it using lowly expressed genes as the invariants - that is are we not filtering aggressively enough. 
+
+```{r}
+data.frame(filtered_data$E, invarient = c(1:dim(filtered_data$E)[1]) %in% invariants) %>%
+  melt(id.vars = "invarient", variable.name="SlideName", value.name="E") %>%
+  merge(targets) %>%
+  subset(replicate == 2) %>%
+  ggplot(aes(x=E, col=invarient)) +
+  geom_density() +
+  scale_x_log10() + 
+  facet_wrap(~knockdown+fraction)
+```
+
+The invariants are all in the top and the bottom? interesting. I wonder if those at the top are selected because they are beyond the linear range of the array? Might be worth excluding genes in the top 5%? Of course it could be real: highly expressed genes escape the effects of the knockdown. Also looks like we could use a slightly harsher low expression cut off. 
+
+```{r}
+neg95 <- apply(bc_data$E[bc_data$genes$ControlType == -1,], 2, function(x) quantile(x,p=0.95))
+cutoff = matrix(1.5*neg95, nrow(bc_data), ncol(bc_data), byrow=TRUE)
+isexpr <- rowSums(bc_data$E > cutoff) >=3
+print(table(isexpr))
+filtered_data <- bc_data[isexpr,]
+print (paste("Spots before control removal", dim(bc_data$E)[1]))
+print (paste("Spots after control removal", dim(filtered_data$E)[1]))
+invariants <- getInvariant(filtered_data, count=500, 
+                          exclude = filtered_data$genes$ControlType != 0 | rowMeans(filtered_data$E) > 100000)
+data.frame(filtered_data$E, invarient = c(1:dim(filtered_data$E)[1]) %in% invariants) %>%
+  melt(id.vars = "invarient", variable.name="SlideName", value.name="E") %>%
+  merge(targets) %>%
+  subset(replicate == 2) %>%
+  ggplot(aes(x=E, col=invarient)) +
+  geom_density() +
+  scale_x_log10() + 
+  facet_wrap(~knockdown+fraction)
+```
+
+Now we normalize
+```{r}
+GRSN_norm_data <- normalizeToInvarients(filtered_data, invariants, 0.25)
+GRSN_normed_spikein_data = GRSN_norm_data[GRSN_norm_data$genes$ProbeName %in% spikeins$probe,]
+data.frame(GRSN_normed_spikein_data$E, conc=spikeins[GRSN_normed_spikein_data$genes$ProbeName,"conc"]) %>% 
+  melt(id.vars="conc", variable.name="SlideName", value.name="E") %>%
+  merge(targets) %>%
+  ggplot(aes(x=conc, y=E, col=fraction, group=paste(fraction,replicate))) +
+  geom_smooth(lwd=0.5, alpha=0.5) +
+  facet_wrap(~knockdown) +
+  theme_bw(base_size = 9) +
+  ggtitle("Post-normalisation spike in curves")
+```
+
+
+What happens if we use the spikins as the normalising factor?
+
+```{r}
+spikein_normed <- normalizeToInvarients(filtered_data, which(filtered_data$genes$ControlType==1), f=0.25)
+sin_normed_spikein_data = spikein_normed[spikein_normed$genes$ProbeName %in% spikeins$probe,]
+data.frame(sin_normed_spikein_data$E, conc=spikeins[sin_normed_spikein_data$genes$ProbeName,"conc"]) %>% 
+  melt(id.vars="conc", variable.name="SlideName", value.name="E") %>%
+  merge(targets) %>%
+  ggplot(aes(x=conc, y=E, col=fraction, group=paste(fraction,replicate))) +
+  geom_smooth(lwd=0.5, alpha=0.5) +
+  facet_wrap(~knockdown) +
+  theme_bw(base_size = 9) +
+  ggtitle("Post-normalisation spike in curves")
+```
+
+Well obviously the spikeins look perfect!
 So this is definately more homogenious that it was before. Lets hope that we havn't lost important information
 Lets look what the clustering looks like
 
@@ -392,7 +607,7 @@ Lets look what the clustering looks like
 row.colours = rep("white", times = length(colnames(bc_data)))
 row.colours[outliers] <- "blue"
 library(gplots)
-cormat <- cor(normed_data$E)
+cormat <- cor(spikein_normed$E)
 distmat = as.dist(1-cormat)
 clust = hclust(distmat)
 dend = as.dendrogram(clust)
@@ -402,21 +617,30 @@ So, looking at this we see: For the most part, the Total and cytoplasmic sample 
 
 Now to create the design matrix. We only want to deal with the single knockdowns to start with. All of the knockdowns are:
 
-```{r}
-neg95 <- apply(normed_data$E[normed_data$genes$ControlType == -1,], 2, function(x) quantile(x,p=0.95))
-cutoff = matrix(1.1*neg95, nrow(normed_data), ncol(normed_data), byrow=TRUE)
-isexpr <- rowSums(normed_data$E > cutoff) >=3
-print(table(isexpr))
-filtered_normed_data <- normed_data[normed_data$genes$ControlType == 0 & isexpr,]
-print (paste("Spots before control removal", dim(normed_data$E)[1]))
-print (paste("Spots after control removal", dim(filtered_normed_data$E)[1]))
-```
 
 ```{r}
 unique(targets$knockdown)
 ```
 
 So we want ALYREF, CHTOP, CIRP, CONTROL, DDX39, SPT16, SSRP1, THOC5, UAP56, UIF, LUZP4:
+
+```{r}
+neqc_data <- normalizeBetweenArrays(filtered_data, method="quantile")
+neqc_spikein_data = neqc_data[neqc_data$genes$ProbeName %in% spikeins$probe,]
+data.frame(neqc_spikein_data$E, conc=spikeins[sin_normed_spikein_data$genes$ProbeName,"conc"]) %>% 
+  melt(id.vars="conc", variable.name="SlideName", value.name="E") %>%
+  merge(targets) %>%
+  ggplot(aes(x=conc, y=E, col=fraction, group=paste(fraction,replicate))) +
+  geom_smooth(lwd=0.5, alpha=0.5) +
+  facet_wrap(~knockdown) +
+  theme_bw(base_size = 9) +
+  ggtitle("Post-normalisation spike in curves")
+```
+
+```{r}
+nonorm <- normalizeBetweenArrays(filtered_data, method="none")
+```
+
 
 ```{r}
 targets$fraction <- factor(targets$fraction)
@@ -427,7 +651,7 @@ single_knockdown = c("ALYREF", "CHTOP", "CIRP_37", "CONTROL", "DDX39", "SPT16", 
 single_targets <- subset(targets, knockdown %in% single_knockdown, drop=T)
 single_targets <- droplevels(single_targets)
 single_design <- model.matrix(~fraction*knockdown, data=single_targets)
-single_data = normed_data[,rownames(single_targets)]
+single_data = nonorm[,rownames(single_targets)]
 ```
 
 Okay, we are ready to fit the model:
@@ -453,8 +677,8 @@ rdistmat = as.dist(1-rcormat)
 rclust <- hclust(rdistmat)
 rdend <- as.dendrogram(rclust)
 heatmatrix_cropped <- heatmatrix
-heatmatrix_cropped[heatmatrix_cropped < -2.5] <- -2.5
-heatmatrix_cropped[heatmatrix_cropped > 2.5] <- 2.5
+heatmatrix_cropped[heatmatrix_cropped < -3] <- -3
+heatmatrix_cropped[heatmatrix_cropped > 3] <- 3
 heatmap.2(heatmatrix_cropped, 
           trace = "none", 
           col = colorRampPalette(c("red", "white", "blue")), 
